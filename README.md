@@ -1,277 +1,371 @@
-# ServeBites — Food Delivery Platform
+# ServeBites 🍕
 
-## Project Overview
+A production-grade food delivery platform built with a **Microservices architecture**, **RabbitMQ event streaming**, and **real-time WebSocket communication** — handling the full order lifecycle from restaurant discovery to doorstep delivery.
 
-ServeBites is a full-stack, microservices-based food delivery web application modelled after Zomato. It lets customers browse nearby restaurants, place orders, and pay online; gives restaurant owners a dashboard to manage their menu and incoming orders; enables delivery riders to receive and fulfil orders in real time; and gives a platform admin the ability to verify new restaurants and riders before they go live. The system uses geolocation to match customers with nearby restaurants and available riders within a configurable radius.
-
-**Target users:** food customers (browse, order, pay), restaurant sellers (manage menu, accept orders, update status), delivery riders (receive and complete deliveries), and platform admins (vet new sellers and riders).
+> Built with: `Node.js` · `TypeScript` · `React 19` · `MongoDB` · `RabbitMQ` · `Socket.io` · `Docker` · `Razorpay` · `Stripe` · `Cloudinary`
 
 ---
 
-## Monorepo Structure
+## 🎯 Project Overview
+
+ServeBites is a full-stack, event-driven food delivery application where six independently deployable microservices collaborate over RabbitMQ queues and real-time WebSocket channels to deliver a seamless ordering experience.
+
+**Who uses it:**
+
+| Role | What they do |
+|---|---|
+| 🧑‍💻 Customer | Browse nearby restaurants by GPS, manage cart, place orders, track delivery on a live map |
+| 🍽️ Seller | Manage restaurant profile, menu items, and incoming orders; update order status in real time |
+| 🛵 Rider | Receive order alerts via WebSocket, toggle availability, accept deliveries, share live GPS |
+| 🔐 Admin | Verify new restaurants and riders before they go live on the platform |
+
+---
+
+## 🏗️ System Architecture
+
+### Microservices Topology
 
 ```
-servebites/
-├── frontend/                  # React 19 + Vite SPA — customer, seller, rider, and admin UIs
-└── services/
-    ├── auth/                  # Authentication service — Google OAuth + JWT (port 5000)
-    ├── restaurant/            # Core service — restaurants, menu, cart, addresses, orders (port 5001)
-    ├── utils/                 # Utility service — Cloudinary image upload, Razorpay, Stripe payments (port 5002)
-    ├── realtime/              # Real-time service — Socket.io server + internal event emitter (port 5004)
-    ├── rider/                 # Rider service — rider profiles, availability, order acceptance (port 5005)
-    └── admin/                 # Admin service — verify pending restaurants and riders (port 5006)
+                            ┌─────────────────────────────────┐
+                            │         React 19 Frontend         │
+                            │  Vite · Tailwind · Socket.io-client│
+                            │  Leaflet Maps · React Router v7   │
+                            └──────────────┬──────────────────┘
+                                           │ HTTPS
+          ┌────────────────────────────────┼────────────────────────────────┐
+          │                                │                                │
+    ┌─────▼──────┐                  ┌──────▼──────┐                ┌────────▼────────┐
+    │  Auth :5000 │                 │ Restaurant  │                │   Utils :5002   │
+    │             │                 │   :5001     │                │                 │
+    │ Google OAuth│                 │             │                │ Cloudinary CDN  │
+    │ JWT (15 day)│                 │ MongoDB     │                │ Razorpay        │
+    └─────────────┘                 │ $geoNear    │                │ Stripe          │
+                                    │ 2dsphere    │                └────────┬────────┘
+                                    └──────┬──────┘                        │
+                                           │                                │
+                              ┌────────────▼─────────────┐                 │
+                              │        RabbitMQ Broker    │◄────────────────┘
+                              │                           │    payment_event queue
+                              │  • payment_event          │
+                              │  • order_ready_queue      │
+                              └────────────┬─────────────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    │                      │                       │
+              ┌─────▼──────┐       ┌───────▼─────┐       ┌───────▼──────┐
+              │ Rider :5005 │       │ Realtime    │       │ Admin :5006  │
+              │             │       │   :5004     │       │              │
+              │ $near 500m  │       │             │       │ MongoDB      │
+              │ GPS stream  │       │ Socket.io   │       │ native driver│
+              └─────────────┘       │ WebSocket   │       └──────────────┘
+                                    │ fan-out hub │
+                                    └─────────────┘
+```
+
+### Event-Driven Order Flow
+
+```
+  Customer                 Restaurant              RabbitMQ              Rider               Socket.io
+     │                         │                      │                    │                     │
+     │──POST /order/place──────►│                      │                    │                     │
+     │                         │──publish(payment_evt)─►                    │                     │
+     │                         │                      │                    │                     │
+     │◄─redirect Razorpay/Stripe│                      │                    │                     │
+     │                         │                      │                    │                     │
+     │──payment callback───────►│ (Utils verifies sig) │                    │                     │
+     │                         │◄──consume(payment_evt)│                    │                     │
+     │                         │  status = "placed"    │                    │                     │
+     │                         │──POST /internal/emit──────────────────────────────────────────►│
+     │◄────────────────────────────────────────────────────── order:new (room: user:<id>) ───────│
+     │                         │                      │                    │                     │
+     │                         │ Seller accepts order  │                    │                     │
+     │                         │──status="ready_for_rider"──publish(order_ready)─►               │
+     │                         │                      │──consume(order_rdy)─►                    │
+     │                         │                      │                    │──POST /internal/emit─►│
+     │◄──────────────────────────────────────────────── order:available (room: restaurant:<id>)──│
+     │                         │                      │                    │                     │
+     │                         │                      │                    │ Rider accepts        │
+     │                         │                      │                    │──POST /internal/emit─►│
+     │◄─────────────────────────────────────────────────── order:rider_assigned (room: user:<id>)│
+     │                         │                      │                    │                     │
+     │◄─── rider:location (live GPS every N seconds, room: user:<id>) ─────────────────────────-│
 ```
 
 ---
 
-## Tech Stack Summary
+## ⚡ Technical Highlights
 
-### Frontend (`frontend/`)
+| Area | What's Under the Hood |
+|---|---|
+| **Microservices** | 6 independently deployable Express.js 5 services, each with its own MongoDB connection, Docker image, and responsibility boundary |
+| **RabbitMQ (Event Streaming)** | `payment_event` queue (Utils → Restaurant) triggers order confirmation; `order_ready_queue` (Restaurant → Rider) triggers rider dispatch — fully async, no polling |
+| **WebSockets (Socket.io 4)** | Realtime service acts as a centralized fan-out hub; other services POST to `/internal/emit` via `x-internal-key`; clients subscribe to rooms `user:<id>` and `restaurant:<id>` |
+| **Geospatial MongoDB** | `$geoNear` aggregation to find restaurants within radius; `$near` query to find available riders within 500 m of order address — backed by 2dsphere indexes |
+| **Dual Payment Gateways** | Razorpay (HMAC-SHA256 signature verification) and Stripe (Checkout session redirect) — customer picks either at checkout |
+| **Google OAuth 2.0** | Auth-code flow (`googleapis` library) — frontend receives auth code, passes to backend, backend exchanges for tokens and fetches user profile |
+| **JWT Architecture** | Single shared `JWT_SEC` across all 5 backend services; 15-day expiry; full user object embedded in payload |
+| **Cloudinary Pipeline** | All images (restaurants, menu items, rider profiles) converted to DataURI at frontend, uploaded through Utils service, stored on Cloudinary v2 |
+| **Live Routing Maps** | Leaflet + Leaflet-Routing-Machine using OSRM API; rider GPS coordinates emitted over WebSocket and rendered on customer's live map |
+| **Docker Multi-stage** | `node:22-alpine` base; build stage compiles TypeScript, production stage copies only `dist/` + production deps — minimal image size |
+
+---
+
+## 🗄️ Data Architecture
+
+All services share a single **`ServeBites`** MongoDB database. Services access only the collections they own.
+
+| Collection | Service | Key Fields & Indexes |
+|---|---|---|
+| `users` | Auth | `email` (unique), `googleId`, `role` (`customer`/`seller`/`rider`/`admin`) |
+| `restaurants` | Restaurant | `owner` (ObjectId), `autoLocation` **(2dsphere)**, `isVerified`, `cuisines[]` |
+| `menuitems` | Restaurant | `restaurant` (ObjectId), `name`, `price`, `image` (Cloudinary URL) |
+| `carts` | Restaurant | `user` (ObjectId), `items[{menuItem, quantity}]`, `restaurant` |
+| `orders` | Restaurant | `status` (9-stage enum), `paymentMethod`, `deliveryFee`, `platformFee`, `expiresAt` **(TTL 15 min)** |
+| `addresses` | Restaurant | `user` (ObjectId), `location` **(2dsphere)**, `houseNo`, `area`, `city` |
+| `riders` | Rider | `user` (ObjectId), `location` **(2dsphere)**, `isAvailable`, `isVerified`, `currentOrder` |
+
+**Order status lifecycle:**
+```
+placed → accepted → preparing → ready_for_rider → rider_assigned → picked_up → delivered
+                                                                             └──► cancelled
+```
+
+**Fee calculation (from source):**
+- `deliveryFee` = `subtotal < 250 ? ₹49 : ₹0`
+- `platformFee` = `₹7` (flat)
+- `riderAmount` = `Math.ceil(distanceKm) × ₹17`
+
+---
+
+## 🛠️ Tech Stack
+
+### Frontend
 
 | Concern | Technology |
 |---|---|
-| Framework | React 19, TypeScript |
-| Build tool | Vite 7 |
+| Framework | React 19 + TypeScript |
+| Build | Vite 7 |
 | Styling | Tailwind CSS 4 |
 | Routing | React Router DOM v7 |
-| HTTP client | Axios |
+| HTTP | Axios |
 | Real-time | Socket.io-client 4 |
-| Maps | Leaflet 1.9 + React-Leaflet 5 + Leaflet-Routing-Machine (OSRM) |
-| Auth | @react-oauth/google (OAuth2 code flow) |
-| Payments | @stripe/stripe-js (Stripe Checkout redirect) |
-| Geocoding | Nominatim (OpenStreetMap) — browser fetch, no API key |
-| Toast notifications | react-hot-toast |
-| Deployment | Vercel (SPA rewrites configured in `vercel.json`) |
+| Maps | Leaflet 1.9 · React-Leaflet 5 · Leaflet-Routing-Machine (OSRM) |
+| Auth | `@react-oauth/google` (OAuth2 auth-code flow) |
+| Payments | `@stripe/stripe-js` (Checkout redirect) |
+| Geocoding | Nominatim / OpenStreetMap (no API key required) |
+| Deployment | Vercel (SPA rewrites via `vercel.json`) |
 
 ### Backend (all services)
 
 | Concern | Technology |
 |---|---|
-| Runtime | Node.js 22 (inferred from Dockerfiles) |
+| Runtime | Node.js 22 |
 | Framework | Express.js 5 |
 | Language | TypeScript 5.9 |
-| Database | MongoDB (Mongoose ODM for auth/restaurant/rider; native MongoDB driver for admin) |
-| Database name | `ServeBites` (hardcoded in db configs) |
-| Message queue | RabbitMQ (amqplib 0.10) |
-| File storage | Cloudinary v2 |
-| Auth tokens | JSON Web Tokens (jsonwebtoken 9, 15-day expiry) |
-| Payment gateway | Razorpay + Stripe |
-| Google OAuth | googleapis 170 |
-| File upload | Multer 2 + datauri |
-| Containerisation | Docker (multi-stage, node:22-alpine) |
+| Database | MongoDB + Mongoose ODM (native driver for Admin) |
+| Message Queue | RabbitMQ via `amqplib` 0.10 |
+| Auth Tokens | JWT (`jsonwebtoken` 9, 15-day, HS256) |
+| File Storage | Cloudinary v2 |
+| Payments | Razorpay + Stripe |
+| OAuth | `googleapis` 170 |
+| Containerisation | Docker (multi-stage, `node:22-alpine`) |
 
 ---
 
-## Prerequisites
+## 📋 Prerequisites
 
-- **Node.js** — v22 (matches Docker base image; no `.nvmrc` present in repo)
-- **npm** — bundled with Node.js 22
-- **MongoDB** — a running MongoDB instance or Atlas cluster (free tier works)
-- **RabbitMQ** — a running broker; the `.env` examples use `amqp://admin:admin123@localhost:5672`
-- **Accounts and API keys required:**
+- **Node.js** v22
+- **MongoDB** — local or Atlas (free tier)
+- **RabbitMQ** — local or CloudAMQP (free tier)
+- **API Keys:**
 
-| Account | Key(s) needed | Used by |
-|---|---|---|
-| Google Cloud Console | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | `auth` service |
-| Cloudinary | `CLOUD_NAME`, `CLOUD_API_KEY`, `CLOUD_SECRET_KEY` | `utils` service |
-| Razorpay | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | `utils` service |
-| Stripe | `STRIPE_SECRET_KEY` (server-side), `VITE_STRIPE_PUBLISHABLE_KEY` (client-side) | `utils` service + frontend |
+| Service | Keys Required |
+|---|---|
+| Google Cloud Console | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` |
+| Cloudinary | `CLOUD_NAME`, `CLOUD_API_KEY`, `CLOUD_SECRET_KEY` |
+| Razorpay | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` |
+| Stripe | `STRIPE_SECRET_KEY` (server), `VITE_STRIPE_PUBLISHABLE_KEY` (client) |
 
 ---
 
-## Getting Started
+## 🚀 Getting Started
 
-### 1. Clone the repository
+**1. Clone the repository**
 
 ```bash
 git clone <repo-url>
-cd servebites
+cd tomato-code        # root folder name
 ```
 
-> **Note:** The root folder on disk is currently named `tomato-code`. Rename it to `servebites` after cloning if desired — this is a local-only operation.
-
-### 2. Install dependencies for each service
+**2. Install dependencies**
 
 ```bash
 # Frontend
 cd frontend && npm install && cd ..
 
-# Backend services
-cd services/auth && npm install && cd ../..
-cd services/restaurant && npm install && cd ../..
-cd services/utils && npm install && cd ../..
-cd services/realtime && npm install && cd ../..
-cd services/rider && npm install && cd ../..
-cd services/admin && npm install && cd ../..
+# All 6 backend services
+for svc in auth restaurant utils realtime rider admin; do
+  cd services/$svc && npm install && cd ../..
+done
 ```
 
-### 3. Set up environment variables
+**3. Configure environment variables**
 
-Create a `.env` file in each service directory, based on the templates below (see **Environment Setup**).
+Create `.env` files in each service directory (see [Environment Variables](#-environment-variables) below).
 
-### 4. Start infrastructure
+> `JWT_SEC` and `INTERNAL_SERVICE_KEY` must be **identical** across all services that reference them.
 
-Ensure MongoDB and RabbitMQ are running locally before starting any service.
-
-### 5. Run each service
-
-Each service uses the same dev command — run in separate terminals:
+**4. Start infrastructure**
 
 ```bash
-# Auth service
-cd services/auth && npm run dev
+# MongoDB (local)
+mongod --dbpath /data/db
 
-# Restaurant service
-cd services/restaurant && npm run dev
-
-# Utils service
-cd services/utils && npm run dev
-
-# Realtime service
-cd services/realtime && npm run dev
-
-# Rider service
-cd services/rider && npm run dev
-
-# Admin service
-cd services/admin && npm run dev
-
-# Frontend
-cd frontend && npm run dev
+# RabbitMQ (Docker)
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=admin \
+  -e RABBITMQ_DEFAULT_PASS=admin123 \
+  rabbitmq:3-management
 ```
 
-### 6. Open the app
+**5. Start all services** (separate terminals)
 
-Navigate to `http://localhost:5173` in your browser.
+```bash
+cd services/auth      && npm run dev    # :5000
+cd services/restaurant && npm run dev   # :5001
+cd services/utils      && npm run dev   # :5002
+cd services/realtime   && npm run dev   # :5004
+cd services/rider      && npm run dev   # :5005
+cd services/admin      && npm run dev   # :5006
+cd frontend            && npm run dev   # :5173
+```
+
+**6. Open** `http://localhost:5173`
 
 ---
 
-## Environment Setup
+## 🔧 Environment Variables
 
-### `services/auth/.env`
-
-```env
-PORT=5000
-MONGO_URI=<your MongoDB connection string>
-JWT_SEC=<a long random secret string>
-GOOGLE_CLIENT_ID=<from Google Cloud Console>
-GOOGLE_CLIENT_SECRET=<from Google Cloud Console>
-```
-
-### `services/restaurant/.env`
-
-```env
-PORT=5001
-MONGO_URI=<your MongoDB connection string>
-JWT_SEC=<same JWT secret as auth service>
-UTILS_SERVICE=http://localhost:5002
-REALTIME_SERVICE=http://localhost:5004
-INTERNAL_SERVICE_KEY=<a long random secret shared across all services>
-RABBITMQ_URL=amqp://admin:admin123@localhost:5672
-PAYMENT_QUEUE=payment_event
-RIDER_QUEUE=rider_queue
-ORDER_READY_QUEUE=order_ready_queue
-```
-
-### `services/utils/.env`
-
-```env
-PORT=5002
-CLOUD_NAME=<Cloudinary cloud name>
-CLOUD_API_KEY=<Cloudinary API key>
-CLOUD_SECRET_KEY=<Cloudinary API secret>
-STRIPE_SECRET_KEY=<Stripe secret key>
-FRONTEND_URL=http://localhost:5173
-RESTAURANT_SERVICE=http://localhost:5001
-INTERNAL_SERVICE_KEY=<same key as restaurant service>
-RABBITMQ_URL=amqp://admin:admin123@localhost:5672
-PAYMENT_QUEUE=payment_event
-RAZORPAY_KEY_ID=<Razorpay key ID>
-RAZORPAY_KEY_SECRET=<Razorpay key secret>
-```
-
-### `services/realtime/.env`
-
-```env
-PORT=5004
-JWT_SEC=<same JWT secret as auth service>
-INTERNAL_SERVICE_KEY=<same key as restaurant service>
-```
-
-### `services/rider/.env`
-
-```env
-PORT=5005
-MONGO_URI=<your MongoDB connection string>
-JWT_SEC=<same JWT secret as auth service>
-UTILS_SERVICE=http://localhost:5002
-REALTIME_SERVICE=http://localhost:5004
-RESTAURANT_SERVICE=http://localhost:5001
-INTERNAL_SERVICE_KEY=<same key as restaurant service>
-RABBITMQ_URL=amqp://admin:admin123@localhost:5672
-RIDER_QUEUE=rider_queue
-ORDER_READY_QUEUE=order_ready_queue
-```
-
-### `services/admin/.env`
-
-```env
-PORT=5006
-MONGO_URI=<your MongoDB connection string>
-JWT_SEC=<same JWT secret as auth service>
-DB_NAME=ServeBites
-```
-
-### `frontend/.env`
-
-```env
-VITE_STRIPE_PUBLISHABLE_KEY=<Stripe publishable key>
-VITE_INTERNAL_SERVICE_KEY=<same internal service key — see security note in SPEC.md>
-```
-
-> **Note:** `JWT_SEC` and `INTERNAL_SERVICE_KEY` must be identical across all services that use them. They are shared secrets.
+| Variable | Service | Description |
+|---|---|---|
+| `PORT` | all | Service port (5000–5006) |
+| `MONGO_URI` | auth, restaurant, rider | MongoDB connection string |
+| `JWT_SEC` | auth, restaurant, utils, realtime, rider, admin | Shared JWT signing secret |
+| `GOOGLE_CLIENT_ID` | auth | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | auth | Google OAuth client secret |
+| `UTILS_SERVICE` | restaurant, rider | Base URL of utils service |
+| `REALTIME_SERVICE` | restaurant, rider | Base URL of realtime service |
+| `RESTAURANT_SERVICE` | utils, rider | Base URL of restaurant service |
+| `INTERNAL_SERVICE_KEY` | restaurant, utils, realtime, rider | Shared key for inter-service calls |
+| `RABBITMQ_URL` | restaurant, utils, rider | RabbitMQ connection string |
+| `PAYMENT_QUEUE` | restaurant, utils | Queue name: `payment_event` |
+| `ORDER_READY_QUEUE` | restaurant, rider | Queue name: `order_ready_queue` |
+| `RIDER_QUEUE` | restaurant, rider | Queue name: `rider_queue` |
+| `CLOUD_NAME` | utils | Cloudinary cloud name |
+| `CLOUD_API_KEY` | utils | Cloudinary API key |
+| `CLOUD_SECRET_KEY` | utils | Cloudinary API secret |
+| `RAZORPAY_KEY_ID` | utils | Razorpay key ID |
+| `RAZORPAY_KEY_SECRET` | utils | Razorpay key secret |
+| `STRIPE_SECRET_KEY` | utils | Stripe secret key |
+| `FRONTEND_URL` | utils | Frontend origin for Stripe redirect |
+| `DB_NAME` | admin | MongoDB database name (`ServeBites`) |
+| `VITE_STRIPE_PUBLISHABLE_KEY` | frontend | Stripe publishable key |
+| `VITE_INTERNAL_SERVICE_KEY` | frontend | Internal service key (dev only) |
 
 ---
 
-## Key Scripts
+## 📡 API Reference
 
-### Per-service (same across all backend services)
+### Auth Service `:5000`
 
-| Script | What it does |
-|---|---|
-| `npm run dev` | Compiles TypeScript in watch mode and hot-reloads the Node server with `concurrently` |
-| `npm run build` | Compiles TypeScript to `dist/` via `tsc` |
-| `npm start` | Runs the compiled output from `dist/index.js` — used in production / Docker |
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/auth/google` | Exchange Google auth code for JWT |
+| `GET` | `/api/v1/auth/me` | Get current authenticated user |
+| `PUT` | `/api/v1/auth/update-role` | Assign role to user (customer/seller/rider) |
+| `GET` | `/api/v1/auth/logout` | Clear auth session |
 
-### Frontend
+### Restaurant Service `:5001`
 
-| Script | What it does |
-|---|---|
-| `npm run dev` | Starts Vite dev server at `http://localhost:5173` |
-| `npm run build` | Type-checks and builds static assets to `dist/` |
-| `npm run preview` | Serves the production build locally for inspection |
-| `npm run lint` | Runs ESLint across all source files |
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/restaurant/new` | Create restaurant profile |
+| `GET` | `/api/v1/restaurant/nearby` | Get restaurants near user's GPS coordinates (`$geoNear`) |
+| `GET` | `/api/v1/restaurant/:id` | Get restaurant details + menu |
+| `POST` | `/api/v1/menu/add` | Add menu item (with Cloudinary image) |
+| `POST` | `/api/v1/cart/add` | Add item to cart |
+| `POST` | `/api/v1/order/place` | Place order → publishes to RabbitMQ |
+| `PUT` | `/api/v1/order/status` | Update order status (seller) |
+| `GET` | `/api/v1/order/restaurant` | Get all orders for a restaurant |
+| `GET` | `/api/v1/order/user` | Get all orders for a customer |
+
+### Utils Service `:5002`
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/upload` | Upload image to Cloudinary (DataURI body) |
+| `POST` | `/api/v1/payment/razorpay` | Create Razorpay order |
+| `POST` | `/api/v1/payment/razorpay/verify` | Verify Razorpay signature |
+| `POST` | `/api/v1/payment/stripe` | Create Stripe Checkout session |
+| `GET` | `/api/v1/payment/stripe/success` | Stripe success redirect handler |
+
+### Rider Service `:5005`
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/rider/register` | Register as rider |
+| `PUT` | `/api/v1/rider/availability` | Toggle rider availability |
+| `PUT` | `/api/v1/rider/location` | Update rider GPS coordinates |
+| `POST` | `/api/v1/rider/accept` | Accept a delivery order |
+| `PUT` | `/api/v1/rider/status` | Update delivery status (picked_up / delivered) |
+
+### Admin Service `:5006`
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/admin/restaurants` | List pending restaurants |
+| `PUT` | `/api/v1/admin/restaurant/verify` | Verify a restaurant |
+| `GET` | `/api/v1/admin/riders` | List pending riders |
+| `PUT` | `/api/v1/admin/rider/verify` | Verify a rider |
+
+### Realtime Service `:5004` (internal only)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/internal/emit` | Emit Socket.io event to a room (requires `x-internal-key`) |
 
 ---
 
-## Deployment
+## 📋 Scripts
 
-### Frontend
+| Script | Command | Description |
+|---|---|---|
+| Dev (backend) | `npm run dev` | TypeScript watch + Node hot-reload via `concurrently` |
+| Build (backend) | `npm run build` | Compile TypeScript → `dist/` |
+| Start (backend) | `npm start` | Run compiled `dist/index.js` (production / Docker) |
+| Dev (frontend) | `npm run dev` | Vite dev server at `:5173` |
+| Build (frontend) | `npm run build` | Type-check + Vite production build → `dist/` |
+| Preview (frontend) | `npm run preview` | Serve production build locally |
+| Lint (frontend) | `npm run lint` | ESLint across all source files |
 
-Deployed on **Vercel**. The `frontend/vercel.json` file rewrites all routes to `index.html` to support client-side routing.
+---
+
+## 🐳 Deployment
+
+### Frontend → Vercel
+
+`frontend/vercel.json` rewrites all routes to `index.html` for client-side routing:
 
 ```json
-{
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
-}
+{ "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }] }
 ```
 
-### Backend services
+### Backend → Docker
 
-Each service has a **multi-stage Dockerfile** based on `node:22-alpine`. The build stage compiles TypeScript; the production stage copies only compiled output and production dependencies.
+Each service has a multi-stage Dockerfile (`node:22-alpine`):
 
 ```dockerfile
-# Build stage
+# Stage 1: Build
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
@@ -280,7 +374,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
-# Production stage
+# Stage 2: Production
 FROM node:22-alpine
 WORKDIR /app
 COPY package*.json ./
@@ -289,15 +383,9 @@ COPY --from=builder /app/dist ./dist
 CMD ["node", "dist/index.js"]
 ```
 
-**CI/CD:** No CI/CD configuration file (e.g. GitHub Actions, `.gitlab-ci.yml`) is present in the repository. Deployment pipeline is not documented in codebase — needs input from team.
+### Service Port Reference
 
-**Docker Compose:** No `docker-compose.yml` is present. Each service must be orchestrated manually or via a deployment platform. Needs input from team.
-
----
-
-## Service Port Reference
-
-| Service | Default Port |
+| Service | Port |
 |---|---|
 | Auth | 5000 |
 | Restaurant | 5001 |
@@ -306,3 +394,76 @@ CMD ["node", "dist/index.js"]
 | Rider | 5005 |
 | Admin | 5006 |
 | Frontend (dev) | 5173 |
+
+---
+
+## 🏁 Project Structure
+
+```
+tomato-code/
+├── README.md
+├── SPEC.md                          # Full architectural specification
+├── frontend/
+│   ├── index.html
+│   ├── vite.config.ts
+│   ├── vercel.json                  # SPA routing rewrites
+│   └── src/
+│       ├── App.tsx                  # Route definitions (React Router v7)
+│       ├── types.ts                 # Shared TypeScript interfaces
+│       ├── context/
+│       │   ├── AppContext.tsx        # Global auth + cart state
+│       │   └── SocketContext.tsx     # Socket.io connection + event listeners
+│       ├── pages/
+│       │   ├── Home.tsx             # Restaurant discovery (GPS + $geoNear)
+│       │   ├── Restaurant.tsx       # Menu browsing + add to cart
+│       │   ├── Cart.tsx             # Cart management
+│       │   ├── Checkout.tsx         # Razorpay / Stripe payment
+│       │   ├── OrderPage.tsx        # Live order tracking
+│       │   ├── UserOrderMap.tsx     # Leaflet map with OSRM rider route
+│       │   ├── RiderDashboard.tsx   # Rider availability + order list
+│       │   ├── Admin.tsx            # Admin verification panel
+│       │   └── ...
+│       └── components/
+│           ├── RiderOrderMap.tsx    # Rider's live map view
+│           ├── RiderOrderRequest.tsx # Incoming delivery alert
+│           └── ...
+└── services/
+    ├── auth/                        # Google OAuth + JWT issuing
+    │   └── src/
+    │       ├── controllers/auth.ts
+    │       └── model/User.ts
+    ├── restaurant/                  # Core domain service
+    │   └── src/
+    │       ├── controllers/         # orders, cart, menu, address, restaurant
+    │       ├── models/              # Order, Cart, MenuItem, Restaurant, Address
+    │       └── config/
+    │           ├── rabbitmq.ts      # Channel setup
+    │           ├── order.publisher.ts   # Publishes to payment_event
+    │           └── payment.consumer.ts  # Consumes payment_event
+    ├── utils/                       # Cloudinary + Payments
+    │   └── src/
+    │       └── controllers/
+    │           ├── upload.ts        # Cloudinary DataURI upload
+    │           └── payment.ts       # Razorpay + Stripe handlers
+    ├── realtime/                    # Socket.io hub
+    │   └── src/
+    │       ├── socket.ts            # io setup + room management
+    │       └── routes/internal.ts  # POST /internal/emit
+    ├── rider/                       # Rider lifecycle
+    │   └── src/
+    │       ├── controllers/         # register, accept, location, status
+    │       └── model/Rider.ts       # 2dsphere location index
+    └── admin/                       # Verification-only service
+        └── src/
+            └── controllers/admin.ts
+```
+
+---
+
+## 📄 License
+
+This project is open source and available under the [MIT License](LICENSE).
+
+---
+
+*Built with Node.js · TypeScript · React 19 · MongoDB · RabbitMQ · Socket.io · Docker · Razorpay · Stripe · Cloudinary · Leaflet*
