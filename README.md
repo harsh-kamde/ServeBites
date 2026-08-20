@@ -1,5 +1,5 @@
-# ServeBites 🍕      
-
+# ServeBites 🍕       
+ 
 A production-grade food delivery platform built with a **Microservices architecture**, **RabbitMQ event streaming**, and **real-time WebSocket communication** — handling the full order lifecycle from restaurant discovery to doorstep delivery.
 
 > Built with: `Node.js` · `TypeScript` · `React 19` · `MongoDB` · `RabbitMQ` · `Socket.io` · `Docker` · `Razorpay` · `Stripe` · `Cloudinary`
